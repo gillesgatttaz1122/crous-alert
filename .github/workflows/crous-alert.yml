@@ -1,0 +1,38 @@
+name: Alerte logement CROUS
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: crous-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restaurer les annonces déjà vues
+        uses: actions/cache/restore@v4
+        with:
+          path: crous_seen.json
+          key: crous-seen-${{ github.run_id }}
+          restore-keys: crous-seen-
+
+      - name: Vérifier les nouveaux logements
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # Paris intra-muros (bounds = lonOuest_latNord_lonEst_latSud). Remplaçable via la variable CROUS_URL.
+          CROUS_URL: ${{ vars.CROUS_URL || 'https://trouverunlogement.lescrous.fr/tools/47/search?bounds=2.224122_48.902156_2.4697602_48.8155755' }}
+        run: python3 crous_alert.py
+
+      - name: Sauvegarder les annonces vues
+        if: always() && hashFiles('crous_seen.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: crous_seen.json
+          key: crous-seen-${{ github.run_id }}
