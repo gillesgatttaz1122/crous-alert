@@ -6,8 +6,13 @@ Variables d'environnement :
   CROUS_URL   URL de recherche (défaut : https://trouverunlogement.lescrous.fr/tools/47/search)
   STATE_FILE  fichier des annonces déjà vues (défaut : crous_seen.json)
   MAX_PAGES   nombre maximum de pages parcourues (défaut : 20)
+  MSE_LOGIN, MSE_PASSWORD  identifiants MesServices.etudiant.gouv.fr : sans
+              connexion, la recherche n'affiche pas tous les logements
 """
+import base64
+import hashlib
 import html
+import http.cookiejar
 import json
 import os
 import re
@@ -20,6 +25,8 @@ URL = os.environ.get("CROUS_URL") or f"{BASE}/tools/47/search"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 STATE_FILE = os.environ.get("STATE_FILE", "crous_seen.json")
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))
+MSE_LOGIN = os.environ.get("MSE_LOGIN", "")
+MSE_PASSWORD = os.environ.get("MSE_PASSWORD", "")
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 
 # Chaque annonce pointe vers /tools/<id>/accommodations/<id>.
@@ -30,10 +37,70 @@ LINK_RE = re.compile(
 TAG_RE = re.compile(r"<[^>]+>")
 
 
+# Les cookies de session (Crous + MSE) sont conservés entre les requêtes.
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+
+def request(url, form=None):
+    """Renvoie (url finale après redirections, corps de la page)."""
+    headers = {"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        # Comme un navigateur : sans Origin, le site refuse le formulaire (403).
+        parts = urllib.parse.urlsplit(url)
+        headers["Origin"] = f"{parts.scheme}://{parts.netloc}"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    # Le serveur MSE met parfois près d'une minute à répondre.
+    with OPENER.open(req, timeout=90) as r:
+        return r.geturl(), r.read().decode("utf-8", "replace")
+
+
 def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "fr-FR,fr;q=0.9"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", "replace")
+    return request(url)[1]
+
+
+def hidden(body, name):
+    m = re.search(r'name="' + re.escape(name) + r'"[^>]*value="([^"]*)"', body)
+    if not m:
+        raise RuntimeError(f"champ {name} introuvable sur la page de connexion")
+    return html.unescape(m.group(1))
+
+
+def solve_altcha(body):
+    """Résout la case « Je ne suis pas un robot » (ALTCHA, preuve de travail SHA-256)."""
+    m = re.search(r"challengejson=(\{.*?\})\s", html.unescape(body), re.S)
+    if not m:
+        raise RuntimeError("captcha ALTCHA introuvable sur la page de connexion")
+    ch = json.loads(m.group(1))
+    prefix = ch["salt"].encode()
+    for n in range(ch["maxNumber"] + 1):
+        if hashlib.sha256(prefix + str(n).encode()).hexdigest() == ch["challenge"]:
+            payload = {k: ch[k] for k in ("algorithm", "challenge", "salt", "signature")}
+            payload["number"] = n
+            return base64.b64encode(json.dumps(payload).encode()).decode()
+    raise RuntimeError("captcha ALTCHA non résolu")
+
+
+def login():
+    """Connexion MesServices.etudiant.gouv.fr puis retour sur trouverunlogement."""
+    # 1. Choix du type de compte (« Mon compte » = 0).
+    url, body = request(f"{BASE}/mse/discovery/connect")
+    challenge = hidden(body, "login[loginChallenge]")
+    url, body = request(url, {"login[app]": "0", "login[loginChallenge]": challenge,
+                              "login[_token]": hidden(body, "login[_token]")})
+    # 2. Formulaire identifiant / mot de passe / captcha.
+    url, body = request(url, {"login[login]": MSE_LOGIN, "login[password]": MSE_PASSWORD,
+                              "login[altcha]": solve_altcha(body),
+                              "login[_token]": hidden(body, "login[_token]")})
+    if not url.startswith(BASE):
+        raise RuntimeError(f"connexion MSE échouée (arrêt sur {url})")
+    print("connecté à MesServices.etudiant.gouv.fr")
+    # 3. À la première recherche de la session, le site affiche ses règles :
+    #    « Passer à la recherche de logements ».
+    url, body = request(URL)
+    if 'name="searchSubmit"' in body:
+        request(url, {"toolId": hidden(body, "toolId"), "searchSubmit": ""})
 
 
 def page_url(n):
@@ -85,6 +152,12 @@ def main():
         seen = set()
         first_run = True
 
+    if MSE_LOGIN and MSE_PASSWORD:
+        try:
+            login()
+        except Exception as e:
+            notify("Alerte CROUS : connexion impossible", str(e), "https://messervices.etudiant.gouv.fr")
+            raise
     current = scrape()
     new_ids = [i for i in current if i not in seen]
     print(f"{len(current)} annonce(s) en ligne, {len(new_ids)} nouvelle(s)")

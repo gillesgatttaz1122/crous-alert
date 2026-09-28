@@ -12,7 +12,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +26,9 @@ jobs:
       - name: Vérifier les nouveaux logements
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # Compte MesServices.etudiant.gouv.fr : sans connexion, une partie des logements est masquée.
+          MSE_LOGIN: ${{ secrets.MSE_LOGIN }}
+          MSE_PASSWORD: ${{ secrets.MSE_PASSWORD }}
           # Paris intra-muros (bounds = lonOuest_latNord_lonEst_latSud). Remplaçable via la variable CROUS_URL.
           CROUS_URL: ${{ vars.CROUS_URL || 'https://trouverunlogement.lescrous.fr/tools/47/search?bounds=2.224122_48.902156_2.4697602_48.8155755' }}
         run: python3 crous_alert.py
